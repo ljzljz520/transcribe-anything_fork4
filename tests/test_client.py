@@ -15,6 +15,7 @@ import pytest
 from starlette.testclient import TestClient
 
 from transcribe_anything import client as client_mod
+from transcribe_anything import net_policy
 from transcribe_anything.client import (
     RemoteTranscriberError,
     resolve_remote_and_token,
@@ -23,6 +24,12 @@ from transcribe_anything.client import (
 )
 from transcribe_anything.server_app import create_app
 from transcribe_anything.server_config import ServerConfig
+
+
+@pytest.fixture(autouse=True)
+def _simulated_dns(monkeypatch):
+    """Hermetic DNS: submissions here are URL-shaped, never socket-tested."""
+    monkeypatch.setattr(net_policy, "default_resolver", lambda _host: ["1.1.1.1"])
 
 
 def _fake_transcribe(text: str = "hello"):

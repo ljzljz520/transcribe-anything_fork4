@@ -97,6 +97,27 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         default=200,
         help="cadence at which the streaming backend emits partial events (ms). Default 200.",
     )
+    parser.add_argument(
+        "--allow-host",
+        action="append",
+        default=[],
+        metavar="HOST",
+        help=(
+            "Explicit administrator authorization for an otherwise-restricted destination host "
+            "(repeatable). Media URLs targeting loopback/RFC1918/link-local/etc. are rejected by "
+            "default; this opts a single host (or '.example.com' suffix) in. Clients cannot grant this."
+        ),
+    )
+    parser.add_argument(
+        "--allow-cidr",
+        action="append",
+        default=[],
+        metavar="CIDR",
+        help=(
+            "Explicit administrator authorization for an IP range, e.g. 10.0.0.0/8 (repeatable). "
+            "Only affects otherwise-restricted ranges; clients cannot grant this."
+        ),
+    )
     parser.add_argument("--hf-token", default=None, help="HuggingFace token (never echoed to clients)")
     parser.add_argument(
         "--prefetch",
@@ -178,6 +199,8 @@ def _config_from_args(args: argparse.Namespace) -> "ServerConfig":  # type: igno
         allow_stream=bool(args.allow_stream),
         max_stream_duration_seconds=args.max_stream_duration,
         stream_decode_interval_ms=args.stream_decode_interval_ms,
+        network_allow_hosts=list(args.allow_host),
+        network_allow_cidrs=list(args.allow_cidr),
     )
 
 

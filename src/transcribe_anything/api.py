@@ -26,6 +26,7 @@ from appdirs import user_config_dir  # type: ignore
 from transcribe_anything.audio import fetch_audio
 from transcribe_anything.insanely_fast_whisper import run_insanely_fast_whisper
 from transcribe_anything.logger import log_error
+from transcribe_anything.net_policy import NetPolicy
 from transcribe_anything.util import (
     chop_double_extension,
     get_static_ffmpeg_runtime_dir,
@@ -170,13 +171,13 @@ def get_video_name_from_url(url: str) -> str:
             # env["set PYTHONIOENCODING=utf-8"]
             env["PYTHONIOENCODING"] = "utf-8"
             cp = subprocess.run(
-                cmd_str,
+                cmd_list,
                 check=True,
                 capture_output=True,
                 universal_newlines=True,
                 cwd=temp_dir,
                 env=env,
-                shell=True,
+                shell=False,
             )
             stdout = cp.stdout
             lines = stdout.split("\n")
@@ -232,6 +233,7 @@ def transcribe(
     initial_prompt: Optional[str] = None,
     align: bool = False,
     align_model: Optional[str] = None,
+    net_policy: Optional[NetPolicy] = None,
 ) -> str:
     """
     Runs the transcription program.
@@ -259,6 +261,10 @@ def transcribe(
                      Defaults to WhisperX's per-language defaults; pass a
                      HuggingFace wav2vec2 model id to use a language that
                      isn't in those defaults.
+        net_policy: Daemon-only egress policy. When set, network input is
+                    SSRF-guarded and local input is restricted to files
+                    quarantined under ``output_dir``. The local CLI leaves
+                    this unset.
 
     Returns:
         Path to the output directory containing transcription files
@@ -286,11 +292,25 @@ def transcribe(
         output_dir = os.path.join(output_dir, language)
     print(f"making dir {output_dir}")
     os.makedirs(output_dir, exist_ok=True)
+    if net_policy is not None and not (url_or_file.startswith("http://") or url_or_file.startswith("https://") or url_or_file.startswith("ftp://")):
+        # Daemon mode: local-path inputs are legitimate ONLY for files the
+        # daemon itself quarantined under the per-job artifact dir via
+        # multipart upload. Any other path (client-named '/etc/passwd',
+        # symlink tricks, relative escapes) is refused before ffmpeg opens
+        # it. The local CLI never supplies net_policy, so CLI file input
+        # keeps working unchanged.
+        artifact_root = Path(output_dir).resolve()
+        try:
+            input_resolved = Path(url_or_file).resolve(strict=True)
+        except OSError as exc:
+            raise ValueError(f"local input is not a file inside the job directory: {url_or_file!r}") from exc
+        if not input_resolved.is_relative_to(artifact_root):
+            raise ValueError("daemon jobs may only read local files uploaded into the job directory")
     tmp_wav = make_temp_wav()
     try:
         assert os.path.isdir(output_dir), f"Path {output_dir} is not found or not a directory."
         # tmp_mp3 = os.path.join(output_dir, "out.mp3")
-        fetch_audio(url_or_file, tmp_wav)
+        fetch_audio(url_or_file, tmp_wav, net_policy=net_policy)
         assert os.path.exists(tmp_wav), f"Path {tmp_wav} doesn't exist."
         # filemd5 = md5(file.encode("utf-8")).hexdigest()
         # key = f"{file}-{filemd5}-{model}"

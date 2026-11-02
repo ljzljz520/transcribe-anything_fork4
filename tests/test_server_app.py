@@ -35,6 +35,19 @@ from transcribe_anything.server_app import (
 # --------------------- helpers ---------------------
 
 
+@pytest.fixture(autouse=True)
+def _simulated_dns(monkeypatch):
+    """Keep SSRF policy checks hermetic: no real DNS in the daemon tests.
+
+    Every non-literal hostname is simulated as a routable public IP.
+    Tests that need a name to resolve internally pass an explicit
+    resolver to net_policy.check_url / build a specific policy fixture.
+    """
+    from transcribe_anything import net_policy
+
+    monkeypatch.setattr(net_policy, "default_resolver", lambda _host: ["1.1.1.1"])
+
+
 def _fake_transcribe_factory(transcript_text: str = "hello world"):
     """Return a fn matching transcribe(...) signature that writes out.{txt,srt,vtt,json}."""
 

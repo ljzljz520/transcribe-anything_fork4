@@ -38,6 +38,8 @@ from pathlib import Path
 from queue import Empty, Full, Queue
 from typing import Any, Callable, Optional
 
+from transcribe_anything.net_policy import NetPolicy, NetPolicyError, check_url, follow_url
+
 LOG = logging.getLogger("transcribe_anything.server")
 
 DEFAULT_PORT = 8765
@@ -97,9 +99,20 @@ class ServerConfig:
     allow_stream: bool = False
     max_stream_duration_seconds: int = 60 * 60
     stream_decode_interval_ms: int = 200
+    # SSRF egress policy for client-submitted network URLs (#network-isolation).
+    # Empty by default: public internet is reachable; loopback/RFC1918/
+    # link-local/etc. are denied. Only the operator (not clients) can
+    # authorize restricted destinations at startup via --allow-host /
+    # --allow-cidr. Lists round-trip through config_to_env as JSON.
+    network_allow_hosts: list = field(default_factory=list)
+    network_allow_cidrs: list = field(default_factory=list)
 
     def requires_auth(self) -> bool:
         return not _is_loopback(self.host)
+
+    def get_net_policy(self) -> NetPolicy:
+        """Build the locked egress policy used for all client-driven fetches."""
+        return NetPolicy(allow_hosts=tuple(self.network_allow_hosts), allow_cidrs=tuple(self.network_allow_cidrs))
 
     def validate(self) -> None:
         if self.requires_auth() and not self.auth_token:
@@ -108,6 +121,9 @@ class ServerConfig:
             raise ValueError(f"--prefetch must be one of lazy|eager|none, got {self.prefetch!r}")
         if self.max_queue < 1:
             raise ValueError("--max-queue must be >= 1")
+        # Validate admin network authorizations up front (fail at startup,
+        # not at first request).
+        self.get_net_policy()
 
 
 class JobStatus(str, Enum):
@@ -151,6 +167,32 @@ class SettingsViolation(ValueError):
 
 _DAEMON_LOCKED_FIELDS = ("device", "hf_token", "hugging_face_token", "flash", "prefetch")
 
+# Client requests must never steer where the daemon reads inputs from or
+# writes artifacts / scratch to. Inputs arrive only via the multipart
+# 'file' field or a policy-checked network 'url'; outputs always land in
+# the per-job artifact dir. Allowing these keys through would let a
+# client point the backend at internal files or overwrite server paths.
+_CLIENT_FORBIDDEN_FIELDS = frozenset(
+    (
+        "input",
+        "input_path",
+        "url_or_file",
+        "file_path",
+        "path",
+        "output",
+        "output_dir",
+        "out_dir",
+        "output_path",
+        "job_root",
+        "artifact_dir",
+        "net_policy",
+        "allow_hosts",
+        "allow_cidrs",
+        "network_allow_hosts",
+        "network_allow_cidrs",
+    )
+)
+
 
 def validate_request_options(options: dict, config: ServerConfig) -> dict:
     """Validate per-request options against the daemon's settings ownership table.
@@ -158,12 +200,15 @@ def validate_request_options(options: dict, config: ServerConfig) -> dict:
     Returns the normalized request body (input field + cleaned options).
     Raises :class:`SettingsViolation` on conflict.
     """
+    policy = config.get_net_policy()
     cleaned: dict = {}
     for key, value in (options or {}).items():
         if value is None:
             continue
         if key in _DAEMON_LOCKED_FIELDS:
             raise SettingsViolation(f"setting {key!r} is daemon-locked and cannot be overridden per request")
+        if key in _CLIENT_FORBIDDEN_FIELDS:
+            raise SettingsViolation(f"setting {key!r} is a server-internal path/setting and cannot be set by clients")
         if key == "model":
             if not config.allow_client_model and value != config.model:
                 raise SettingsViolation(
@@ -190,10 +235,22 @@ def validate_request_options(options: dict, config: ServerConfig) -> dict:
                 raise SettingsViolation("daemon does not permit webhook callbacks (start with --allow-webhooks)")
             if not isinstance(value, str) or not (value.startswith("http://") or value.startswith("https://")):
                 raise SettingsViolation(f"webhook_url must be an http(s) URL, got {value!r}")
+            # Static subset (no DNS): blocks literal internal targets at
+            # submission; hostnames get the full DNS/redirect check when
+            # the webhook actually fires.
+            try:
+                check_url_static(value, policy)
+            except NetPolicyError as exc:
+                raise SettingsViolation(f"webhook_url not permitted by daemon network policy: {exc}") from exc
             cleaned["webhook_url"] = value
             continue
         cleaned[key] = value
     return cleaned
+
+
+def check_url_static(url: str, policy: NetPolicy) -> None:
+    """Run the DNS-free subset of the egress policy check."""
+    check_url(url, policy, resolve_names=False)
 
 
 def is_model_cached(model: Optional[str]) -> bool:
@@ -234,6 +291,9 @@ class JobStore:
     def __init__(self, config: ServerConfig, transcribe_fn: Optional[Callable[..., str]] = None) -> None:
         self.config = config
         self.transcribe_fn = transcribe_fn or _default_transcribe_fn
+        # Egress policy applied to every client-driven network fetch
+        # (media URLs inside the worker, webhook callbacks).
+        self.net_policy = config.get_net_policy()
         self._jobs: dict = {}
         self._lock = threading.Lock()
         self._queue: Queue = Queue(maxsize=config.max_queue)
@@ -347,6 +407,7 @@ class JobStore:
                 initial_prompt=request.get("initial_prompt"),
                 align=bool(request.get("align", False)),
                 align_model=request.get("align_model"),
+                net_policy=self.net_policy,
             )
             artifacts = self.list_artifacts(job)
             with self._lock:
@@ -371,7 +432,12 @@ class JobStore:
             t.start()
 
     def _fire_webhook(self, job: Job, webhook_url: str) -> None:
-        """POST the terminal job manifest to ``webhook_url``. Errors swallowed."""
+        """POST the terminal job manifest to ``webhook_url``. Errors swallowed.
+
+        The same egress policy guarding media fetches applies here, and is
+        enforced on every redirect hop (open redirects to internal
+        addresses are blocked before the daemon connects).
+        """
         try:
             import httpx  # local import: keeps server_config FastAPI-free
         except ImportError:
@@ -380,7 +446,10 @@ class JobStore:
         payload = job.to_public_dict()
         try:
             with httpx.Client(timeout=self.config.webhook_timeout_seconds) as client:
-                client.post(webhook_url, json=payload)
+                def _post_once(current_url: str):
+                    return client.post(current_url, json=payload)
+
+                follow_url(webhook_url, self.net_policy, _post_once)
         except Exception as exc:  # pylint: disable=broad-except
             redacted = _redact_secrets(str(exc), self.config.hf_token)
             LOG.warning("webhook POST to %s failed: %s", webhook_url, redacted)
@@ -596,11 +665,17 @@ def config_to_env(config: ServerConfig) -> dict:
 def config_from_env(env) -> ServerConfig:
     """Inverse of :func:`config_to_env`. Missing keys fall back to dataclass defaults."""
     defaults = {f.name: f.default for f in dataclasses.fields(ServerConfig)}
+    factories = {f.name: f.default_factory for f in dataclasses.fields(ServerConfig)}
     cfg: dict = {}
     for name, default in defaults.items():
         raw = env.get(f"TRANSCRIBE_ANYTHING_SERVER_{name.upper()}")
         if raw is None:
-            cfg[name] = default if default is not dataclasses.MISSING else None
+            if default is not dataclasses.MISSING:
+                cfg[name] = default
+            elif factories[name] is not dataclasses.MISSING:
+                cfg[name] = factories[name]()
+            else:
+                cfg[name] = None
             continue
         try:
             cfg[name] = json.loads(raw)

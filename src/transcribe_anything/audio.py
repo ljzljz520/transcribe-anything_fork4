@@ -7,7 +7,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from typing import Optional
 
+from transcribe_anything.net_policy import NetPolicy
 from transcribe_anything.util import PROCESS_TIMEOUT
 from transcribe_anything.ytldp_download import ytdlp_download
 
@@ -54,13 +56,20 @@ def _convert_to_wav(inpath: str, outpath: str, speech_normalization: bool = Fals
     assert os.path.exists(outpath), f"The expected file {outpath} doesn't exist"
 
 
-def fetch_audio(url_or_file: str, out_wav: str) -> None:
-    """Fetches from the internet or from a local file and outputs a wav file."""
+def fetch_audio(url_or_file: str, out_wav: str, net_policy: Optional[NetPolicy] = None) -> None:
+    """Fetches from the internet or from a local file and outputs a wav file.
+
+    When ``net_policy`` is supplied (daemon mode) every network fetch —
+    entry URL, redirects, playlists, segments, and the yt-dlp downloader
+    subprocess boundary — is constrained by it. Local-file input is
+    passed straight to ffmpeg and is policy-free by design (the local
+    CLI user owns their own filesystem).
+    """
     assert out_wav.endswith(".wav")
     if url_or_file.startswith("http") or url_or_file.startswith("ftp"):
         with tempfile.TemporaryDirectory() as tmpdir:
             print(f"Using temporary directory {tmpdir}")
-            downloaded_file = ytdlp_download(url_or_file, os.path.abspath(tmpdir))
+            downloaded_file = ytdlp_download(url_or_file, os.path.abspath(tmpdir), policy=net_policy)
             print("Downloaded file: ", downloaded_file)
             _convert_to_wav(downloaded_file, out_wav, speech_normalization=True)
         sys.stderr.write("Downloading complete.\n")

@@ -74,6 +74,7 @@ from transcribe_anything.server_config import (
     is_model_cached,
     validate_request_options,
 )
+from transcribe_anything.net_policy import NetPolicyError, check_url
 
 
 def create_app(
@@ -223,6 +224,8 @@ def create_app(
             "max_upload_size_bytes": config.max_upload_size_bytes,
             "warmup": warmup_state,
             "hf_token_configured": bool(config.hf_token),
+            "network_allow_hosts": list(config.network_allow_hosts),
+            "network_allow_cidrs": list(config.network_allow_cidrs),
         }
 
     @app.post("/v1/transcribe", status_code=202)
@@ -266,6 +269,14 @@ def create_app(
                 url = body.get("url")
                 if not url or not isinstance(url, str):
                     raise HTTPException(status_code=400, detail="JSON submission requires a 'url' field")
+                # A JSON submission can ONLY name a network URL. Bare local
+                # paths and file:// URLs would otherwise make the daemon read
+                # arbitrary server-side files (its artifact dirs, configs,
+                # cloud credentials) — local files enter via multipart upload.
+                try:
+                    await asyncio.to_thread(check_url, url, config.get_net_policy())
+                except NetPolicyError as exc:
+                    raise HTTPException(status_code=400, detail=f"submitted url is not permitted by the daemon network policy: {exc}") from exc
                 options = {k: v for k, v in body.items() if k != "url"}
                 input_path = url
 
@@ -507,12 +518,34 @@ def create_app(
     return app
 
 
+def _safe_upload_filename(filename: str) -> str:
+    """Reduce a client-supplied upload filename to a single safe basename.
+
+    Strips any directory component (Unix *and* Windows separators),
+    control characters, and leading dots so the result cannot traverse
+    outside the per-job artifact dir or clobber dotfiles.
+    """
+    name = (filename or "").replace("\\", "/").split("/")[-1]
+    name = "".join(ch for ch in name if ord(ch) >= 32 and ch != "\x7f").strip()
+    name = name.lstrip(".")
+    return name or "upload.bin"
+
+
 def _save_upload(upload, dest_dir: Path, max_bytes: int) -> str:
-    """Stream an UploadFile to ``dest_dir``, enforcing ``max_bytes``."""
+    """Stream an UploadFile to ``dest_dir``, enforcing ``max_bytes``.
+
+    The output is quarantined under ``dest_dir/_input`` and the resolved
+    path is verified to stay inside the job's artifact dir — uploads are
+    a server-side input source and must never be able to overwrite
+    daemon-internal paths regardless of the client's filename.
+    """
     filename = getattr(upload, "filename", None) or "upload.bin"
-    safe = Path(filename).name
-    out = dest_dir / "_input" / safe
+    safe = _safe_upload_filename(filename)
+    base = dest_dir.resolve()
+    out = (dest_dir / "_input" / safe)
     out.parent.mkdir(parents=True, exist_ok=True)
+    if not out.resolve().is_relative_to(base):
+        raise HTTPException(status_code=400, detail="upload filename escapes the job directory")
     total = 0
     with open(out, "wb") as fh:
         while True:

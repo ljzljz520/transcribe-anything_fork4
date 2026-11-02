@@ -121,7 +121,7 @@ def test_api_routes_device_insane_flash_to_insane_backend_with_flash(monkeypatch
     output_dir = tmp_path / "out"
     calls: list[dict[str, Any]] = []
 
-    def fake_fetch_audio(_url_or_file: str, wav_path: str) -> None:
+    def fake_fetch_audio(_url_or_file: str, wav_path: str, net_policy=None) -> None:
         Path(wav_path).write_bytes(b"fake wav")
 
     def fake_run_insane(**kwargs: Any) -> None:
